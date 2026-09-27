@@ -1,0 +1,13 @@
+[package]
+name = "kvcache"
+version = "0.1.0"
+edition = "2021"
+description = "Generic on-disk, size-bounded, LRU-evicted byte-blob cache keyed by an arbitrary string."
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+redb = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+fs4 = "0.13"
