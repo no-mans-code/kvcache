@@ -144,6 +144,33 @@ impl Cache {
         Ok(())
     }
 
+    /// Deletes `key` if present, adjusting the tracked total accordingly.
+    /// Returns whether it existed. For a caller that needs a stale entry
+    /// gone *now* rather than waiting for LRU pressure to age it out - e.g.
+    /// when whatever the entry was keyed against (a document, a session)
+    /// no longer applies and should not linger even briefly.
+    pub fn remove(&self, key: &str) -> Result<bool> {
+        let txn = self.db.begin_write()?;
+        let existed = {
+            let mut entries = txn.open_table(ENTRIES)?;
+            let mut meta = txn.open_table(META)?;
+            let removed_size: Option<u64> = entries.remove(key)?.map(|v| serde_json::from_str::<StoredEntry>(v.value())).transpose()?.map(|e| e.size);
+            match removed_size {
+                Some(size) => {
+                    let total: u64 = meta
+                        .get("total_bytes")?
+                        .and_then(|v| v.value().parse().ok())
+                        .unwrap_or(0);
+                    meta.insert("total_bytes", total.saturating_sub(size).to_string().as_str())?;
+                    true
+                }
+                None => false,
+            }
+        };
+        txn.commit()?;
+        Ok(existed)
+    }
+
     pub fn stats(&self) -> Result<CacheStats> {
         let txn = self.db.begin_read()?;
         let entries = txn.open_table(ENTRIES)?;
@@ -160,8 +187,13 @@ impl Cache {
     }
 }
 
+/// Nanosecond resolution, not milliseconds - `last_accessed` only needs to
+/// establish a strict recency *order*, and millisecond resolution ties
+/// easily within a single fast `put`/`get` sequence (confirmed: caused
+/// `eviction_removes_the_least_recently_used_entry_first` to flake, since a
+/// tie falls back to redb's iteration order, not true recency).
 fn now() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as u64
 }
 
 /// `min(available space on the volume containing `path` / 2, 50 GB)` - a
@@ -240,6 +272,26 @@ mod tests {
         assert_eq!(cache.get("b").unwrap(), None, "b was least-recently-used, should be evicted");
         assert_eq!(cache.get("c").unwrap(), Some(b"ccccc".to_vec()));
         assert!(cache.stats().unwrap().total_bytes <= 10);
+    }
+
+    #[test]
+    fn remove_deletes_an_entry_and_frees_its_bytes() {
+        let path = TempPath(temp_cache_path("remove"));
+        let cache = Cache::open(&path.0, 1_000_000).unwrap();
+        cache.put("a", b"12345").unwrap();
+        cache.put("b", b"1234567890").unwrap();
+
+        assert!(cache.remove("a").unwrap(), "should report the key existed");
+        assert_eq!(cache.get("a").unwrap(), None, "removed entry should be gone");
+        assert_eq!(cache.get("b").unwrap(), Some(b"1234567890".to_vec()), "unrelated entry untouched");
+        assert_eq!(cache.stats().unwrap().total_bytes, 10, "freed bytes reflected in total");
+    }
+
+    #[test]
+    fn remove_on_a_missing_key_is_a_harmless_no_op() {
+        let path = TempPath(temp_cache_path("remove-missing"));
+        let cache = Cache::open(&path.0, 1_000_000).unwrap();
+        assert!(!cache.remove("nope").unwrap(), "should report the key did not exist");
     }
 
     #[test]
